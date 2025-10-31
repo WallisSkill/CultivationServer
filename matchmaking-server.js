@@ -62,7 +62,7 @@ function createWebSocketServer({ server } = {}) {
                 }
                 clients.set(socket, { id, profile, finding: false });
                 ids.set(id, socket);
-                socket.send(JSON.stringify({ type: 'info', message: 'Profile registered.' }));
+                socket.send(JSON.stringify({ type: 'info', message: 'Đã đăng ký hồ sơ.' }));
                 return;
             }
 
@@ -78,7 +78,7 @@ function createWebSocketServer({ server } = {}) {
                 const entry = { socket, profile: msg.profile };
                 if (!tryMatch(entry)) {
                     waiting.push(entry);
-                    socket.send(JSON.stringify({ type: 'info', message: 'Finding opponent...' }));
+                    socket.send(JSON.stringify({ type: 'info', message: 'Đang tìm trận...' }));
                 }
                 return;
             }
@@ -88,14 +88,14 @@ function createWebSocketServer({ server } = {}) {
                 if (info) info.finding = false;
                 const idx = waiting.findIndex((w) => w.socket === socket);
                 if (idx >= 0) waiting.splice(idx, 1);
-                socket.send(JSON.stringify({ type: 'info', message: 'Matchmaking canceled.' }));
+                socket.send(JSON.stringify({ type: 'info', message: 'Đã hủy tìm trận.' }));
                 return;
             }
 
             if (msg.type === 'pvp_relay' && msg.to) {
                 const target = ids.get(msg.to);
                 if (!target || target.readyState !== 1) {
-                    socket.send(JSON.stringify({ type: 'info', message: 'Target offline.' }));
+                    socket.send(JSON.stringify({ type: 'info', message: 'Đối thủ ngoại tuyến.' }));
                     return;
                 }
                 target.send(JSON.stringify({
@@ -108,7 +108,7 @@ function createWebSocketServer({ server } = {}) {
                 return;
             }
 
-            socket.send(JSON.stringify({ type: 'info', message: 'Unknown command.' }));
+            socket.send(JSON.stringify({ type: 'info', message: 'Lệnh không xác định.' }));
         });
 
         socket.on('close', () => cleanup(socket));
