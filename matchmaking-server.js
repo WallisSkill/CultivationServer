@@ -108,6 +108,83 @@ function createWebSocketServer({ server } = {}) {
                 return;
             }
 
+            // 🆕 Xử lý friend requests với profile lookup
+            if (msg.type === 'friend_request' && msg.to && msg.from) {
+                const target = ids.get(msg.to);
+                if (!target || target.readyState !== 1) {
+                    socket.send(JSON.stringify({ type: 'info', message: 'Đạo hữu không online.' }));
+                    return;
+                }
+                
+                // 🆕 Gửi thông báo cho người gửi rằng đã tìm thấy target
+                const targetInfo = clients.get(target);
+                if (targetInfo && targetInfo.profile) {
+                    socket.send(JSON.stringify({ 
+                        type: 'friend_request_sent', 
+                        targetName: targetInfo.profile.name,
+                        targetProfile: targetInfo.profile
+                    }));
+                }
+                
+                target.send(JSON.stringify({
+                    type: 'friend_request',
+                    from: msg.from,
+                    fromName: msg.fromName,
+                    fromProfile: msg.fromProfile
+                }));
+                return;
+            }
+
+            if (msg.type === 'friend_accept' && msg.to && msg.from) {
+                const target = ids.get(msg.to);
+                if (target && target.readyState === 1) {
+                    target.send(JSON.stringify({
+                        type: 'friend_accept',
+                        from: msg.from,
+                        fromName: msg.fromName,
+                        fromProfile: msg.fromProfile
+                    }));
+                }
+                return;
+            }
+
+            if (msg.type === 'friend_reject' && msg.to && msg.from) {
+                const target = ids.get(msg.to);
+                if (target && target.readyState === 1) {
+                    target.send(JSON.stringify({
+                        type: 'friend_reject',
+                        from: msg.from
+                    }));
+                }
+                return;
+            }
+
+            if (msg.type === 'friend_remove' && msg.to && msg.from) {
+                const target = ids.get(msg.to);
+                if (target && target.readyState === 1) {
+                    target.send(JSON.stringify({
+                        type: 'friend_remove',
+                        from: msg.from
+                    }));
+                }
+                return;
+            }
+
+            if (msg.type === 'pvp_invite' && msg.to && msg.from) {
+                const target = ids.get(msg.to);
+                if (!target || target.readyState !== 1) {
+                    socket.send(JSON.stringify({ type: 'info', message: 'Đạo hữu không online.' }));
+                    return;
+                }
+                target.send(JSON.stringify({
+                    type: 'pvp_invite',
+                    from: msg.from,
+                    fromName: msg.fromName,
+                    fromProfile: msg.fromProfile
+                }));
+                return;
+            }
+
             socket.send(JSON.stringify({ type: 'info', message: 'Lệnh không xác định.' }));
         });
 
