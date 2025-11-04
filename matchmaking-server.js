@@ -12,6 +12,24 @@ function createWebSocketServer({ server } = {}) {
     function cleanup(socket) {
         const info = clients.get(socket);
         if (!info) return;
+        
+        // 🆕 Thông báo cho bạn bè rằng user đã offline
+        if (info.id) {
+            // Gửi offline notification cho tất cả client đang kết nối
+            clients.forEach((clientInfo, clientSocket) => {
+                if (clientSocket !== socket && clientSocket.readyState === 1) {
+                    try {
+                        clientSocket.send(JSON.stringify({
+                            type: 'friend_offline',
+                            profileId: info.id
+                        }));
+                    } catch(e) {
+                        console.error('Error sending offline notification:', e);
+                    }
+                }
+            });
+        }
+        
         clients.delete(socket);
         if (info.id) ids.delete(info.id);
         const idx = waiting.findIndex((w) => w.socket === socket);
@@ -63,6 +81,22 @@ function createWebSocketServer({ server } = {}) {
                 clients.set(socket, { id, profile, finding: false });
                 ids.set(id, socket);
                 socket.send(JSON.stringify({ type: 'info', message: 'Đã đăng ký hồ sơ.' }));
+                
+                // 🆕 Thông báo cho tất cả client rằng user này đã online
+                clients.forEach((clientInfo, clientSocket) => {
+                    if (clientSocket !== socket && clientSocket.readyState === 1) {
+                        try {
+                            clientSocket.send(JSON.stringify({
+                                type: 'friend_online',
+                                profileId: id,
+                                profile: profile
+                            }));
+                        } catch(e) {
+                            console.error('Error sending online notification:', e);
+                        }
+                    }
+                });
+                
                 return;
             }
 
