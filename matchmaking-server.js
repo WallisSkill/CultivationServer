@@ -185,6 +185,34 @@ function createWebSocketServer({ server } = {}) {
                 return;
             }
 
+            // 🆕 Xử lý pvp_accept
+            if (msg.type === 'pvp_accept' && msg.to && msg.from) {
+                const target = ids.get(msg.to);
+                if (!target || target.readyState !== 1) {
+                    socket.send(JSON.stringify({ type: 'info', message: 'Đối thủ đã offline.' }));
+                    return;
+                }
+                target.send(JSON.stringify({
+                    type: 'pvp_accept',
+                    from: msg.from,
+                    fromName: msg.fromName,
+                    fromProfile: msg.fromProfile
+                }));
+                return;
+            }
+
+            // 🆕 Xử lý pvp_decline
+            if (msg.type === 'pvp_decline' && msg.to && msg.from) {
+                const target = ids.get(msg.to);
+                if (target && target.readyState === 1) {
+                    target.send(JSON.stringify({
+                        type: 'pvp_decline',
+                        from: msg.from
+                    }));
+                }
+                return;
+            }
+
             socket.send(JSON.stringify({ type: 'info', message: 'Lệnh không xác định.' }));
         });
 
