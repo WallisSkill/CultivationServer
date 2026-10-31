@@ -12,7 +12,12 @@ const NAME_MAX_LENGTH = 24;
 const LOC_MAX_LENGTH = 40;
 const BOARD_SIZE = 10;
 const FIRST_REPORT_MAX = 500;
-const SCORE_PER_SECOND = 1;
+const KILLS_PER_SECOND = 1;
+
+/* Điểm một con quái ở cảnh giới realm, khớp với renownPoints của game */
+function maxPointsPerKill(realm) {
+    return Math.round(Math.pow(10, (Number(realm) || 0) / 2));
+}
 
 /* Bảng thiên kiêu: profileId -> { name, token, scores: { loc: { score, at } } } */
 function loadRecords() {
@@ -84,9 +89,10 @@ function createWebSocketServer({ server } = {}) {
         record.name = String(info.profile?.name || '').slice(0, NAME_MAX_LENGTH);
         const now = Date.now();
         const entry = record.scores[loc];
+        const points = maxPointsPerKill(info.profile?.realmIndex);
         const allowed = entry
-            ? entry.score + Math.ceil((now - entry.at) / 1000 * SCORE_PER_SECOND)
-            : FIRST_REPORT_MAX;
+            ? entry.score + Math.ceil((now - entry.at) / 1000 * KILLS_PER_SECOND) * points
+            : FIRST_REPORT_MAX * points;
         const next = Math.min(score, allowed);
         if (entry && next <= entry.score) return;
         record.scores[loc] = { score: next, at: now };
