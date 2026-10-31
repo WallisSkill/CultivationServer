@@ -4,6 +4,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 const DATA_FILE = path.join(process.env.DATA_DIR || __dirname, 'tianjiao.json');
+const LADDER_FILE = path.join(process.env.DATA_DIR || __dirname, 'ladder.json');
 const SAVE_INTERVAL_MS = 30000;
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const POSITION_MIN_MS = 100;
@@ -13,6 +14,35 @@ const LOC_MAX_LENGTH = 40;
 const BOARD_SIZE = 10;
 const FIRST_REPORT_MAX = 500;
 const KILLS_PER_SECOND = 1;
+
+const ELO_START = 1000;
+const ELO_K = 32;
+const LADDER_REWARD_TOP = 10;
+const LADDER_MAX_PENDING = 7;
+const PAIR_DAILY_LIMIT = 3;
+const MATCH_EXPIRE_MS = 3600000;
+const DAY_CHECK_MS = 60000;
+const DAY_OFFSET_MS = 7 * 3600000;
+
+/* Ngày theo giờ Việt Nam */
+function currentDay() {
+    return new Date(Date.now() + DAY_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/* Bảng PvP: players: id -> { token, name, elo, wins, losses, lastDay }, rewards: id -> [{ day, rank }],
+   pairs: số trận tính điểm trong ngày của từng cặp */
+function loadLadder() {
+    try {
+        return JSON.parse(fs.readFileSync(LADDER_FILE, 'utf8'));
+    } catch {
+        return { day: currentDay(), players: {}, rewards: {}, pairs: {} };
+    }
+}
+
+function eloDelta(winner, loser) {
+    const expected = 1 / (1 + Math.pow(10, (loser - winner) / 400));
+    return Math.max(1, Math.round(ELO_K * (1 - expected)));
+}
 
 /* Điểm một con quái ở cảnh giới realm, khớp với renownPoints của game */
 function maxPointsPerKill(realm) {
@@ -36,9 +66,19 @@ function createWebSocketServer({ server } = {}) {
     const ids = new Map();              // profileId -> socket
     const waiting = [];
     const records = loadRecords();
+    const ladder = loadLadder();
+    const matches = new Map();          // matchId -> { a, b, at }
+    let matchSeq = 0;
     let recordsDirty = false;
+    let ladderDirty = false;
 
     const saveTimer = setInterval(() => {
+        if (ladderDirty) {
+            ladderDirty = false;
+            fs.writeFile(LADDER_FILE, JSON.stringify(ladder), err => {
+                if (err) console.error('Error saving ladder:', err);
+            });
+        }
         if (!recordsDirty) return;
         recordsDirty = false;
         fs.writeFile(DATA_FILE, JSON.stringify(records), err => {
@@ -46,6 +86,13 @@ function createWebSocketServer({ server } = {}) {
         });
     }, SAVE_INTERVAL_MS);
     saveTimer.unref();
+
+    const dayTimer = setInterval(() => {
+        rollLadderDay();
+        const limit = Date.now() - MATCH_EXPIRE_MS;
+        matches.forEach((match, id) => { if (match.at < limit) matches.delete(id); });
+    }, DAY_CHECK_MS);
+    dayTimer.unref();
 
     function sendTo(socket, payload) {
         if (socket.readyState === 1) socket.send(JSON.stringify(payload));
@@ -99,6 +146,81 @@ function createWebSocketServer({ server } = {}) {
         recordsDirty = true;
     }
 
+    function ladderSorted() {
+        return Object.entries(ladder.players)
+            .filter(([, p]) => p.wins + p.losses > 0)
+            .sort((a, b) => b[1].elo - a[1].elo);
+    }
+
+    /* Sang ngày mới: top đã đánh trong ngày cũ được ghi thưởng, chờ người chơi tới nhận */
+    function rollLadderDay() {
+        const today = currentDay();
+        if (ladder.day === today) return;
+        ladderSorted().filter(([, p]) => p.lastDay === ladder.day).slice(0, LADDER_REWARD_TOP).forEach(([id], i) => {
+            const pending = ladder.rewards[id] || (ladder.rewards[id] = []);
+            pending.push({ day: ladder.day, rank: i + 1 });
+            ladder.rewards[id] = pending.slice(-LADDER_MAX_PENDING);
+        });
+        ladder.day = today;
+        ladder.pairs = {};
+        ladderDirty = true;
+    }
+
+    function ladderPlayer(id, token, name) {
+        if (!id || !token) return null;
+        const player = ladder.players[id] || (ladder.players[id] = { token, name: '', elo: ELO_START, wins: 0, losses: 0, lastDay: '' });
+        if (player.token !== token) return null;
+        player.name = String(name || player.name).slice(0, NAME_MAX_LENGTH);
+        return player;
+    }
+
+    function ladderView(id) {
+        const sorted = ladderSorted();
+        const me = ladder.players[id];
+        return {
+            type: 'ranked_board',
+            board: sorted.slice(0, LADDER_REWARD_TOP).map(([pid, p]) => ({ id: pid, name: p.name, elo: p.elo, wins: p.wins, losses: p.losses })),
+            me: me ? { elo: me.elo, wins: me.wins, losses: me.losses, rank: sorted.findIndex(([pid]) => pid === id) + 1 } : null
+        };
+    }
+
+    function pairKey(a, b) {
+        return [a, b].sort().join(':');
+    }
+
+    /* Chỉ trận ghép qua tìm trận mới tính điểm; một cặp chỉ tính vài trận mỗi ngày */
+    function openRankedMatch(first, second) {
+        if (first.token === second.token) return null;
+        const a = ladderPlayer(first.profile.id, first.token, first.profile.name);
+        const b = ladderPlayer(second.profile.id, second.token, second.profile.name);
+        if (!a || !b || (ladder.pairs[pairKey(first.profile.id, second.profile.id)] || 0) >= PAIR_DAILY_LIMIT) return null;
+        const matchId = `m${Date.now().toString(36)}_${++matchSeq}`;
+        matches.set(matchId, { a: first.profile.id, b: second.profile.id, at: Date.now() });
+        return matchId;
+    }
+
+    function settleMatch(matchId, loserId) {
+        const match = matches.get(matchId);
+        if (!match || (match.a !== loserId && match.b !== loserId)) return;
+        matches.delete(matchId);
+        rollLadderDay();
+        const winnerId = match.a === loserId ? match.b : match.a;
+        const winner = ladder.players[winnerId], loser = ladder.players[loserId];
+        const delta = eloDelta(winner.elo, loser.elo);
+        winner.elo += delta;
+        loser.elo = Math.max(0, loser.elo - delta);
+        winner.wins++;
+        loser.losses++;
+        winner.lastDay = loser.lastDay = ladder.day;
+        const key = pairKey(winnerId, loserId);
+        ladder.pairs[key] = (ladder.pairs[key] || 0) + 1;
+        ladderDirty = true;
+        [[winnerId, delta], [loserId, -delta]].forEach(([id, change]) => {
+            const target = ids.get(id);
+            if (target) sendTo(target, { ...ladderView(id), change });
+        });
+    }
+
     function cleanup(socket) {
         const info = clients.get(socket);
         if (!info) return;
@@ -122,6 +244,9 @@ function createWebSocketServer({ server } = {}) {
         
         leaveLocation(socket, info);
         clients.delete(socket);
+        if (info.id && (!ids.get(info.id) || ids.get(info.id) === socket)) {
+            matches.forEach((match, matchId) => settleMatch(matchId, info.id));
+        }
         if (info.id && ids.get(info.id) === socket) ids.delete(info.id);
         const idx = waiting.findIndex((w) => w.socket === socket);
         if (idx >= 0) waiting.splice(idx, 1);
@@ -138,8 +263,9 @@ function createWebSocketServer({ server } = {}) {
             const diff = Math.abs((a.realmIndex || 0) - (b.realmIndex || 0));
             if (diff <= maxDiff) {
                 waiting.splice(i, 1);
-                const payloadA = { type: 'match_found', opponent: b };
-                const payloadB = { type: 'match_found', opponent: a };
+                const matchId = openRankedMatch(entry, newEntry);
+                const payloadA = { type: 'match_found', opponent: b, matchId };
+                const payloadB = { type: 'match_found', opponent: a, matchId };
                 entry.socket.send(JSON.stringify(payloadA));
                 newEntry.socket.send(JSON.stringify(payloadB));
                 return true;
@@ -247,6 +373,31 @@ function createWebSocketServer({ server } = {}) {
                 return;
             }
 
+            if (msg.type === 'ranked_get') {
+                const info = clients.get(socket);
+                rollLadderDay();
+                sendTo(socket, ladderView(info?.id));
+                return;
+            }
+
+            if (msg.type === 'ranked_result') {
+                const info = clients.get(socket);
+                if (info?.id && msg.lost === true) settleMatch(String(msg.matchId || ''), info.id);
+                return;
+            }
+
+            if (msg.type === 'ranked_claim') {
+                const info = clients.get(socket);
+                rollLadderDay();
+                const player = ladder.players[info?.id];
+                const rewards = ladder.rewards[info?.id];
+                if (!player || player.token !== String(msg.token || '') || !rewards?.length) return;
+                delete ladder.rewards[info.id];
+                ladderDirty = true;
+                sendTo(socket, { type: 'ranked_rewards', rewards });
+                return;
+            }
+
             if (msg.type === 'find_match' && msg.profile) {
                 const info = clients.get(socket) || {};
                 info.profile = msg.profile;
@@ -256,7 +407,7 @@ function createWebSocketServer({ server } = {}) {
                 if (info.id) ids.set(info.id, socket);
                 const existingIdx = waiting.findIndex((w) => w.socket === socket);
                 if (existingIdx >= 0) waiting.splice(existingIdx, 1);
-                const entry = { socket, profile: msg.profile };
+                const entry = { socket, profile: msg.profile, token: String(msg.token || '') };
                 if (!tryMatch(entry)) {
                     waiting.push(entry);
                     socket.send(JSON.stringify({ type: 'info', message: 'Đang tìm trận...' }));
