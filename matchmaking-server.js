@@ -11,6 +11,9 @@ const MAX_PAYLOAD_BYTES = 64 * 1024;
 const POSITION_MIN_MS = 100;
 const POSITION_FLUSH_MS = 250;
 const SEND_BUFFER_LIMIT = 256 * 1024;
+const RELAY_BUFFER_LIMIT = 32 * 1024;
+const RELAY_DROPPABLE = new Set(['arena_tick', 'tick']);
+const RELAY_SILENT = new Set(['arena_tick', 'tick', 'hb']);
 const HEARTBEAT_MS = 30000;
 const SAY_MAX_LENGTH = 120;
 const NAME_MAX_LENGTH = 24;
@@ -25,6 +28,7 @@ const LADDER_REWARD_TOP = 10;
 const LADDER_MAX_PENDING = 7;
 const PAIR_DAILY_LIMIT = 3;
 const MATCH_EXPIRE_MS = 3600000;
+const MATCH_GRACE_MS = 20000;
 const DAY_CHECK_MS = 60000;
 const DAY_OFFSET_MS = 7 * 3600000;
 
@@ -428,6 +432,13 @@ function createWebSocketServer({ server } = {}) {
         });
     }
 
+    /* Rớt mạng thoáng qua chưa tính thua: hết hạn mà chưa quay lại mới xử */
+    function settleAfterGrace(id) {
+        setTimeout(() => {
+            if (!ids.has(id)) matches.forEach((match, matchId) => settleMatch(matchId, id));
+        }, MATCH_GRACE_MS).unref();
+    }
+
     function cleanup(socket) {
         const info = clients.get(socket);
         if (!info) return;
@@ -439,10 +450,9 @@ function createWebSocketServer({ server } = {}) {
         
         leaveLocation(socket, info);
         clients.delete(socket);
-        if (info.id && (!ids.get(info.id) || ids.get(info.id) === socket)) {
-            matches.forEach((match, matchId) => settleMatch(matchId, info.id));
-        }
+        const leaving = info.id && (!ids.get(info.id) || ids.get(info.id) === socket);
         if (info.id && ids.get(info.id) === socket) ids.delete(info.id);
+        if (leaving) settleAfterGrace(info.id);
         const idx = waiting.findIndex((w) => w.socket === socket);
         if (idx >= 0) waiting.splice(idx, 1);
     }
@@ -643,9 +653,11 @@ function createWebSocketServer({ server } = {}) {
             if (msg.type === 'pvp_relay' && msg.to) {
                 const target = ids.get(msg.to);
                 if (!target || target.readyState !== 1) {
-                    socket.send(JSON.stringify({ type: 'info', message: 'Đối thủ ngoại tuyến.' }));
+                    if (!RELAY_SILENT.has(msg.kind)) socket.send(JSON.stringify({ type: 'info', message: 'Đối thủ ngoại tuyến.' }));
                     return;
                 }
+                /* Ảnh trận chỉ cần cái mới nhất: người nhận nghẽn mạng thì bỏ, khỏi xem trận chậm dần */
+                if (RELAY_DROPPABLE.has(msg.kind) && target.bufferedAmount >= RELAY_BUFFER_LIMIT) return;
                 target.send(JSON.stringify({
                     type: 'pvp_relay',
                     from: (clients.get(socket) || {}).id,
