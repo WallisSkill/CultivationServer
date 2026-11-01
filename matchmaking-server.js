@@ -8,6 +8,8 @@ const LADDER_FILE = path.join(process.env.DATA_DIR || __dirname, 'ladder.json');
 const BOSS_FILE = path.join(process.env.DATA_DIR || __dirname, 'worldboss.json');
 const THRONE_FILE = path.join(process.env.DATA_DIR || __dirname, 'huvo.json');
 const THRONE_MIN_REALM = 32;
+/* Tăng số này để xóa ngôi cũ khi deploy */
+const THRONE_EPOCH = 2;
 const SAVE_INTERVAL_MS = 30000;
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const POSITION_MIN_MS = 100;
@@ -77,7 +79,8 @@ function newBoss() {
 
 function loadThrone() {
     try {
-        return JSON.parse(fs.readFileSync(THRONE_FILE, 'utf8'));
+        const saved = JSON.parse(fs.readFileSync(THRONE_FILE, 'utf8'));
+        return saved.epoch === THRONE_EPOCH ? saved : null;
     } catch {
         return null;
     }
@@ -289,7 +292,7 @@ function createWebSocketServer({ server } = {}) {
         if (!info.id || !name || !msg.token || !stats.every(n => Number.isFinite(n) && n > 0)) return;
         if (!(Number(info.profile?.realmIndex) >= THRONE_MIN_REALM)) return;
         throne = {
-            id: info.id, name, atk: stats[0], def: stats[1], hp: stats[2],
+            epoch: THRONE_EPOCH, id: info.id, name, atk: stats[0], def: stats[1], hp: stats[2],
             look: msg.look && typeof msg.look === 'object' ? msg.look : null,
             elements: Array.isArray(msg.elements) ? msg.elements.slice(0, 5).map(String) : [],
             path: msg.path ? String(msg.path).slice(0, 16) : null,
