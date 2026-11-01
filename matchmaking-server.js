@@ -108,7 +108,9 @@ function createWebSocketServer({ server } = {}) {
     const bossHitAt = new Map();        // profileId -> lúc báo sát thương gần nhất
     const matches = new Map();          // matchId -> { a, b, at }
     let matchSeq = 0;
-    let recordsDirty = false;
+    const nameless = Object.keys(records).filter(id => !records[id].name);
+    nameless.forEach(id => { delete records[id]; });
+    let recordsDirty = nameless.length > 0;
     let ladderDirty = false;
     let bossDirty = false;
     let bossShared = null;
@@ -251,10 +253,11 @@ function createWebSocketServer({ server } = {}) {
         const token = String(msg.token || '');
         const loc = String(msg.loc || '').slice(0, LOC_MAX_LENGTH);
         const score = Math.floor(Number(msg.score));
-        if (!info.id || !token || !loc || !Number.isFinite(score) || score <= 0) return;
-        const record = records[info.id] || (records[info.id] = { token, name: '', scores: {} });
+        const name = String(info.profile?.name || '').slice(0, NAME_MAX_LENGTH);
+        if (!info.id || !token || !loc || !name || !Number.isFinite(score) || score <= 0) return;
+        const record = records[info.id] || (records[info.id] = { token, name, scores: {} });
         if (record.token !== token) return;
-        record.name = String(info.profile?.name || '').slice(0, NAME_MAX_LENGTH);
+        record.name = name;
         const now = Date.now();
         const entry = record.scores[loc];
         const points = maxPointsPerKill(info.profile?.realmIndex);
