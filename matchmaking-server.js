@@ -9,6 +9,9 @@ const BOSS_FILE = path.join(process.env.DATA_DIR || __dirname, 'worldboss.json')
 const SAVE_INTERVAL_MS = 30000;
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const POSITION_MIN_MS = 100;
+const POSITION_FLUSH_MS = 250;
+const SEND_BUFFER_LIMIT = 256 * 1024;
+const HEARTBEAT_MS = 30000;
 const SAY_MAX_LENGTH = 120;
 const NAME_MAX_LENGTH = 24;
 const LOC_MAX_LENGTH = 40;
@@ -29,6 +32,7 @@ const BOSS_WORLDS = ['pham', 'tien', 'thanh', 'thien', 'hondon', 'hongmong', 'ch
 const BOSS_BAR_UNITS = 1000;
 const BOSS_BARS = 20;
 const BOSS_HIT_GAP_MS = 25000;
+const BOSS_BROADCAST_MS = 2000;
 const BOSS_RESPAWN_MS = 3600000;
 const BOSS_MIN_UNITS = 50;
 const BOSS_TOP = 10;
@@ -90,6 +94,9 @@ function createWebSocketServer({ server } = {}) {
 
     const clients = new Map();          // socket -> { id, profile, finding }
     const ids = new Map();              // profileId -> socket
+    const rooms = new Map();            // loc -> Set<socket>
+    const pendingMoves = new Map();     // loc -> Map<profileId, [x, y]>
+    const boards = new Map();           // loc -> top thiên kiêu đã sắp
     const waiting = [];
     const records = loadRecords();
     const ladder = loadLadder();
@@ -100,6 +107,8 @@ function createWebSocketServer({ server } = {}) {
     let recordsDirty = false;
     let ladderDirty = false;
     let bossDirty = false;
+    let bossShared = null;
+    let bossBroadcastTimer = null;
 
     const saveTimer = setInterval(() => {
         if (ladderDirty) {
@@ -130,16 +139,59 @@ function createWebSocketServer({ server } = {}) {
     }, DAY_CHECK_MS);
     dayTimer.unref();
 
+    const moveTimer = setInterval(flushMoves, POSITION_FLUSH_MS);
+    moveTimer.unref();
+
+    /* Kết nối chết không tự đóng: không trả lời ping thì cắt, để khỏi tính là đang online */
+    const heartbeatTimer = setInterval(() => {
+        wss.clients.forEach(socket => {
+            if (socket.isAlive === false) {
+                socket.terminate();
+                return;
+            }
+            socket.isAlive = false;
+            socket.ping();
+        });
+    }, HEARTBEAT_MS);
+    heartbeatTimer.unref();
+
     function sendTo(socket, payload) {
         if (socket.readyState === 1) socket.send(JSON.stringify(payload));
     }
 
-    function socketsAt(loc, except) {
-        const out = [];
-        clients.forEach((info, clientSocket) => {
-            if (info.loc === loc && clientSocket !== except) out.push(clientSocket);
+    /* Gửi cho nhiều người thì chỉ stringify một lần */
+    function sendEach(sockets, payload) {
+        const text = JSON.stringify(payload);
+        sockets.forEach(socket => {
+            if (socket.readyState === 1) socket.send(text);
         });
+    }
+
+    function socketsAt(loc, except) {
+        const room = rooms.get(loc);
+        if (!room) return [];
+        const out = [...room];
+        const i = except ? out.indexOf(except) : -1;
+        if (i >= 0) out.splice(i, 1);
         return out;
+    }
+
+    /* Vị trí gom theo phòng, mỗi người chỉ giữ tọa độ mới nhất; ai nghẽn mạng thì bỏ lượt */
+    function flushMoves() {
+        pendingMoves.forEach((moves, loc) => {
+            const room = rooms.get(loc);
+            if (!room || room.size < 2 || !moves.size) return;
+            const text = JSON.stringify({ type: 'world_moves', loc, moves: [...moves].map(([id, [x, y]]) => [id, x, y]) });
+            room.forEach(socket => {
+                if (socket.readyState === 1 && socket.bufferedAmount < SEND_BUFFER_LIMIT) socket.send(text);
+            });
+        });
+        pendingMoves.clear();
+    }
+
+    /* Hồ sơ chỉ phát lại khi thông tin người khác nhìn thấy đổi, không phát theo chu kỳ */
+    function profileKey(profile) {
+        return JSON.stringify([profile.name, profile.realmIndex, profile.realmStage, profile.rootRank, profile.elements, profile.look]);
     }
 
     function publicPlayer(info) {
@@ -149,16 +201,45 @@ function createWebSocketServer({ server } = {}) {
 
     function leaveLocation(socket, info) {
         if (!info.loc) return;
-        socketsAt(info.loc, socket).forEach(s => sendTo(s, { type: 'world_leave', id: info.id }));
+        const room = rooms.get(info.loc);
+        if (room) {
+            room.delete(socket);
+            if (!room.size) rooms.delete(info.loc);
+        }
+        pendingMoves.get(info.loc)?.delete(info.id);
+        sendEach(socketsAt(info.loc), { type: 'world_leave', id: info.id });
         info.loc = null;
     }
 
+    function joinLocation(socket, info, loc) {
+        info.loc = loc;
+        info.x = info.y = null;
+        sendEach(socketsAt(loc), { type: 'world_join', player: publicPlayer(info) });
+        if (!rooms.has(loc)) rooms.set(loc, new Set());
+        rooms.get(loc).add(socket);
+    }
+
     function tianjiaoBoard(loc) {
-        return Object.entries(records)
-            .filter(([, record]) => record.scores[loc])
-            .map(([id, record]) => ({ id, name: record.name, score: record.scores[loc].score }))
-            .sort((a, b) => b.score - a.score)
-            .slice(0, BOARD_SIZE);
+        if (!boards.has(loc)) {
+            boards.set(loc, Object.entries(records)
+                .filter(([, record]) => record.scores[loc])
+                .map(([id, record]) => ({ id, name: record.name, score: record.scores[loc].score }))
+                .sort((a, b) => b.score - a.score)
+                .slice(0, BOARD_SIZE));
+        }
+        return boards.get(loc);
+    }
+
+    /* Sửa bảng đã sắp tại chỗ: phần lớn điểm báo lên không lọt top nên không tốn gì */
+    function updateBoard(loc, id, name, score) {
+        const board = boards.get(loc);
+        if (!board) return;
+        const entry = board.find(item => item.id === id);
+        if (!entry && board.length >= BOARD_SIZE && score <= board[board.length - 1].score) return;
+        if (entry) Object.assign(entry, { name, score });
+        else board.push({ id, name, score });
+        board.sort((a, b) => b.score - a.score);
+        board.length = Math.min(board.length, BOARD_SIZE);
     }
 
     /* Điểm do máy khách báo: chỉ tăng, và không tăng nhanh hơn tốc độ săn tối đa */
@@ -179,6 +260,7 @@ function createWebSocketServer({ server } = {}) {
         const next = Math.min(score, allowed);
         if (entry && next <= entry.score) return;
         record.scores[loc] = { score: next, at: now };
+        updateBoard(loc, info.id, record.name, next);
         recordsDirty = true;
     }
 
@@ -206,24 +288,41 @@ function createWebSocketServer({ server } = {}) {
         return Object.entries(boss.bosses[world].hits).sort((a, b) => b[1].units - a[1].units);
     }
 
-    function bossView(id) {
-        const bosses = {};
+    /* Phần giống nhau của mọi người chỉ tính lại khi boss đổi */
+    function bossSummary() {
+        if (bossShared) return bossShared;
+        bossShared = {};
         BOSS_WORLDS.forEach(world => {
-            const { hp, respawnAt, hits } = boss.bosses[world];
-            bosses[world] = {
+            const { hp, respawnAt } = boss.bosses[world];
+            bossShared[world] = {
                 hp, respawnAt,
                 maxHp: BOSS_BAR_UNITS * BOSS_BARS,
-                top: bossRanking(world).slice(0, BOSS_TOP).map(([, hit]) => hit),
-                mine: hits[id]?.units || 0
+                top: bossRanking(world).slice(0, BOSS_TOP).map(([, hit]) => hit)
             };
+        });
+        return bossShared;
+    }
+
+    function bossView(id) {
+        const shared = bossSummary();
+        const bosses = {};
+        BOSS_WORLDS.forEach(world => {
+            bosses[world] = { ...shared[world], mine: boss.bosses[world].hits[id]?.units || 0 };
         });
         return { type: 'boss_state', bosses, pending: !!boss.rewards[id]?.length };
     }
 
+    /* Boss đổi thì gom lại rồi báo một lượt, nhiều người đánh cùng lúc không gửi dồn */
     function broadcastBoss() {
-        clients.forEach((info, socket) => {
-            if (info.id) sendTo(socket, bossView(info.id));
-        });
+        bossShared = null;
+        if (bossBroadcastTimer) return;
+        bossBroadcastTimer = setTimeout(() => {
+            bossBroadcastTimer = null;
+            clients.forEach((info, socket) => {
+                if (info.id) sendTo(socket, bossView(info.id));
+            });
+        }, BOSS_BROADCAST_MS);
+        bossBroadcastTimer.unref();
     }
 
     function respawnBosses() {
@@ -244,9 +343,8 @@ function createWebSocketServer({ server } = {}) {
             boss.rewards[id] = pending.slice(-BOSS_MAX_PENDING);
         });
         boss.bosses[world].respawnAt = Date.now() + BOSS_RESPAWN_MS;
-        clients.forEach((info, socket) => {
-            if (info.id) sendTo(socket, { type: 'boss_killed', world, killer });
-        });
+        bossShared = null;
+        sendEach([...clients].filter(([, info]) => info.id).map(([socket]) => socket), { type: 'boss_killed', world, killer });
     }
 
     function bossOwner(id, token) {
@@ -334,21 +432,9 @@ function createWebSocketServer({ server } = {}) {
         const info = clients.get(socket);
         if (!info) return;
         
-        // 🆕 Thông báo cho bạn bè rằng user đã offline
-        if (info.id) {
-            // Gửi offline notification cho tất cả client đang kết nối
-            clients.forEach((clientInfo, clientSocket) => {
-                if (clientSocket !== socket && clientSocket.readyState === 1) {
-                    try {
-                        clientSocket.send(JSON.stringify({
-                            type: 'friend_offline',
-                            profileId: info.id
-                        }));
-                    } catch(e) {
-                        console.error('Error sending offline notification:', e);
-                    }
-                }
-            });
+        // 🆕 Thông báo cho bạn bè rằng user đã offline (đăng nhập lại ở tab khác thì vẫn online)
+        if (info.id && ids.get(info.id) === socket) {
+            sendEach([...clients.keys()].filter(clientSocket => clientSocket !== socket), { type: 'friend_offline', profileId: info.id });
         }
         
         leaveLocation(socket, info);
@@ -384,6 +470,8 @@ function createWebSocketServer({ server } = {}) {
     }
 
     wss.on('connection', (socket) => {
+        socket.isAlive = true;
+        socket.on('pong', () => { socket.isAlive = true; });
         socket.send(JSON.stringify({ type: 'welcome', message: 'Connected to matchmaking server.' }));
 
         socket.on('message', (data) => {
@@ -405,25 +493,22 @@ function createWebSocketServer({ server } = {}) {
                     if (other && other.readyState === 1) other.close(1000, 'Duplicate login');
                 }
                 const previous = clients.get(socket);
-                clients.set(socket, { ...previous, id, profile, finding: false });
+                const key = profileKey(profile);
+                const isNew = previous?.id !== id || !previous.profileText;
+                const changed = isNew || previous.profileKey !== key;
+                const profileText = JSON.stringify({ type: 'friend_online', profileId: id, profile });
+                clients.set(socket, { ...previous, id, profile, profileKey: key, profileText, finding: false });
                 ids.set(id, socket);
-                socket.send(JSON.stringify({ type: 'info', message: 'Đã đăng ký hồ sơ.' }));
-                
-                // 🆕 Thông báo cho tất cả client rằng user này đã online
+                if (!changed) return;
+                if (isNew) socket.send(JSON.stringify({ type: 'info', message: 'Đã đăng ký hồ sơ.' }));
+
+                // 🆕 Người mới nhận danh sách đang online một lần, những người khác chỉ nghe khi có đổi
                 clients.forEach((clientInfo, clientSocket) => {
-                    if (clientSocket !== socket && clientSocket.readyState === 1) {
-                        try {
-                            clientSocket.send(JSON.stringify({
-                                type: 'friend_online',
-                                profileId: id,
-                                profile: profile
-                            }));
-                        } catch(e) {
-                            console.error('Error sending online notification:', e);
-                        }
-                    }
+                    if (clientSocket === socket || clientSocket.readyState !== 1) return;
+                    clientSocket.send(profileText);
+                    if (isNew && clientInfo.profileText) socket.send(clientInfo.profileText);
                 });
-                
+
                 return;
             }
 
@@ -433,9 +518,7 @@ function createWebSocketServer({ server } = {}) {
                 const loc = String(msg.loc || '').slice(0, LOC_MAX_LENGTH);
                 if (info.loc !== loc) {
                     leaveLocation(socket, info);
-                    info.loc = loc;
-                    info.x = info.y = null;
-                    socketsAt(loc, socket).forEach(s => sendTo(s, { type: 'world_join', player: publicPlayer(info) }));
+                    joinLocation(socket, info, loc);
                 }
                 sendTo(socket, {
                     type: 'world_players',
@@ -457,7 +540,8 @@ function createWebSocketServer({ server } = {}) {
                 if (!Number.isFinite(x) || !Number.isFinite(y)) return;
                 info.x = x;
                 info.y = y;
-                socketsAt(info.loc, socket).forEach(s => sendTo(s, { type: 'world_pos', id: info.id, x, y }));
+                if (!pendingMoves.has(info.loc)) pendingMoves.set(info.loc, new Map());
+                pendingMoves.get(info.loc).set(info.id, [x, y]);
                 return;
             }
 
@@ -466,7 +550,7 @@ function createWebSocketServer({ server } = {}) {
                 if (!info || !info.loc) return;
                 const text = String(msg.text || '').slice(0, SAY_MAX_LENGTH);
                 if (!text) return;
-                socketsAt(info.loc, socket).forEach(s => sendTo(s, { type: 'world_say', id: info.id, text }));
+                sendEach(socketsAt(info.loc, socket), { type: 'world_say', id: info.id, text });
                 return;
             }
 
