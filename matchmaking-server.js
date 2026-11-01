@@ -5,6 +5,7 @@ const { WebSocketServer } = require('ws');
 
 const DATA_FILE = path.join(process.env.DATA_DIR || __dirname, 'tianjiao.json');
 const LADDER_FILE = path.join(process.env.DATA_DIR || __dirname, 'ladder.json');
+const BOSS_FILE = path.join(process.env.DATA_DIR || __dirname, 'worldboss.json');
 const SAVE_INTERVAL_MS = 30000;
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const POSITION_MIN_MS = 100;
@@ -23,6 +24,15 @@ const PAIR_DAILY_LIMIT = 3;
 const MATCH_EXPIRE_MS = 3600000;
 const DAY_CHECK_MS = 60000;
 const DAY_OFFSET_MS = 7 * 3600000;
+
+const BOSS_WORLDS = ['pham', 'tien', 'thanh', 'thien', 'hondon', 'hongmong', 'chungnguyen'];
+const BOSS_BAR_UNITS = 1000;
+const BOSS_BARS = 20;
+const BOSS_HIT_GAP_MS = 25000;
+const BOSS_RESPAWN_MS = 3600000;
+const BOSS_MIN_UNITS = 50;
+const BOSS_TOP = 10;
+const BOSS_MAX_PENDING = 7;
 
 /* Ngày theo giờ Việt Nam */
 function currentDay() {
@@ -49,6 +59,22 @@ function maxPointsPerKill(realm) {
     return Math.round(Math.pow(10, (Number(realm) || 0) / 2));
 }
 
+/* Boss thế giới: bosses: world -> { hp, respawnAt, hits: id -> { name, units } }, rewards: id -> [{ world, rank, total }].
+   Máu tính theo đơn vị: một thanh máu trong trận của người chơi là BOSS_BAR_UNITS */
+function newBoss() {
+    return { hp: BOSS_BAR_UNITS * BOSS_BARS, respawnAt: 0, hits: {} };
+}
+
+function loadBoss() {
+    let saved = {};
+    try {
+        saved = JSON.parse(fs.readFileSync(BOSS_FILE, 'utf8'));
+    } catch { }
+    const bosses = saved.bosses || {};
+    BOSS_WORLDS.forEach(world => { bosses[world] = bosses[world] || newBoss(); });
+    return { bosses, rewards: saved.rewards || {}, tokens: saved.tokens || {} };
+}
+
 /* Bảng thiên kiêu: profileId -> { name, token, scores: { loc: { score, at } } } */
 function loadRecords() {
     try {
@@ -67,16 +93,25 @@ function createWebSocketServer({ server } = {}) {
     const waiting = [];
     const records = loadRecords();
     const ladder = loadLadder();
+    const boss = loadBoss();
+    const bossHitAt = new Map();        // profileId -> lúc báo sát thương gần nhất
     const matches = new Map();          // matchId -> { a, b, at }
     let matchSeq = 0;
     let recordsDirty = false;
     let ladderDirty = false;
+    let bossDirty = false;
 
     const saveTimer = setInterval(() => {
         if (ladderDirty) {
             ladderDirty = false;
             fs.writeFile(LADDER_FILE, JSON.stringify(ladder), err => {
                 if (err) console.error('Error saving ladder:', err);
+            });
+        }
+        if (bossDirty) {
+            bossDirty = false;
+            fs.writeFile(BOSS_FILE, JSON.stringify(boss), err => {
+                if (err) console.error('Error saving boss:', err);
             });
         }
         if (!recordsDirty) return;
@@ -89,6 +124,7 @@ function createWebSocketServer({ server } = {}) {
 
     const dayTimer = setInterval(() => {
         rollLadderDay();
+        respawnBosses();
         const limit = Date.now() - MATCH_EXPIRE_MS;
         matches.forEach((match, id) => { if (match.at < limit) matches.delete(id); });
     }, DAY_CHECK_MS);
@@ -164,6 +200,79 @@ function createWebSocketServer({ server } = {}) {
         ladder.day = today;
         ladder.pairs = {};
         ladderDirty = true;
+    }
+
+    function bossRanking(world) {
+        return Object.entries(boss.bosses[world].hits).sort((a, b) => b[1].units - a[1].units);
+    }
+
+    function bossView(id) {
+        const bosses = {};
+        BOSS_WORLDS.forEach(world => {
+            const { hp, respawnAt, hits } = boss.bosses[world];
+            bosses[world] = {
+                hp, respawnAt,
+                maxHp: BOSS_BAR_UNITS * BOSS_BARS,
+                top: bossRanking(world).slice(0, BOSS_TOP).map(([, hit]) => hit),
+                mine: hits[id]?.units || 0
+            };
+        });
+        return { type: 'boss_state', bosses, pending: !!boss.rewards[id]?.length };
+    }
+
+    function broadcastBoss() {
+        clients.forEach((info, socket) => {
+            if (info.id) sendTo(socket, bossView(info.id));
+        });
+    }
+
+    function respawnBosses() {
+        const now = Date.now();
+        const due = BOSS_WORLDS.filter(world => boss.bosses[world].respawnAt && boss.bosses[world].respawnAt <= now);
+        if (!due.length) return;
+        due.forEach(world => { boss.bosses[world] = newBoss(); });
+        bossDirty = true;
+        broadcastBoss();
+    }
+
+    /* Boss chết: ai đủ đóng góp được ghi thưởng theo hạng, chờ tới nhận */
+    function killBoss(world, killer) {
+        const ranking = bossRanking(world).filter(([, hit]) => hit.units >= BOSS_MIN_UNITS);
+        ranking.forEach(([id], i) => {
+            const pending = boss.rewards[id] || (boss.rewards[id] = []);
+            pending.push({ world, rank: i + 1, total: ranking.length });
+            boss.rewards[id] = pending.slice(-BOSS_MAX_PENDING);
+        });
+        boss.bosses[world].respawnAt = Date.now() + BOSS_RESPAWN_MS;
+        clients.forEach((info, socket) => {
+            if (info.id) sendTo(socket, { type: 'boss_killed', world, killer });
+        });
+    }
+
+    function bossOwner(id, token) {
+        if (!id || !token) return false;
+        if (!boss.tokens[id]) boss.tokens[id] = token;
+        return boss.tokens[id] === token;
+    }
+
+    function hitBoss(info, msg) {
+        const world = String(msg.world || '');
+        const target = boss.bosses[world];
+        const token = String(msg.token || '');
+        if (!target || target.hp <= 0 || !bossOwner(info.id, token)) return;
+        const now = Date.now();
+        if (now - (bossHitAt.get(info.id) || 0) < BOSS_HIT_GAP_MS) return;
+        bossHitAt.set(info.id, now);
+        const units = Math.min(BOSS_BAR_UNITS, target.hp, Math.max(0, Math.floor(Number(msg.units) || 0)));
+        if (!units) return;
+        const name = String(info.profile?.name || 'Vô danh').slice(0, NAME_MAX_LENGTH);
+        const hit = target.hits[info.id] || (target.hits[info.id] = { name, units: 0 });
+        hit.name = name;
+        hit.units += units;
+        target.hp -= units;
+        bossDirty = true;
+        if (target.hp <= 0) killBoss(world, name);
+        broadcastBoss();
     }
 
     function ladderPlayer(id, token, name) {
@@ -395,6 +504,29 @@ function createWebSocketServer({ server } = {}) {
                 delete ladder.rewards[info.id];
                 ladderDirty = true;
                 sendTo(socket, { type: 'ranked_rewards', rewards });
+                return;
+            }
+
+            if (msg.type === 'boss_get') {
+                const info = clients.get(socket);
+                respawnBosses();
+                sendTo(socket, bossView(info?.id));
+                return;
+            }
+
+            if (msg.type === 'boss_hit') {
+                const info = clients.get(socket);
+                if (info?.id) hitBoss(info, msg);
+                return;
+            }
+
+            if (msg.type === 'boss_claim') {
+                const info = clients.get(socket);
+                const rewards = boss.rewards[info?.id];
+                if (!rewards?.length || !bossOwner(info.id, String(msg.token || ''))) return;
+                delete boss.rewards[info.id];
+                bossDirty = true;
+                sendTo(socket, { type: 'boss_rewards', rewards });
                 return;
             }
 
