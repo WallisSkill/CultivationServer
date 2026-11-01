@@ -9,7 +9,7 @@ const BOSS_FILE = path.join(process.env.DATA_DIR || __dirname, 'worldboss.json')
 const THRONE_FILE = path.join(process.env.DATA_DIR || __dirname, 'huvo.json');
 const THRONE_MIN_REALM = 32;
 /* Tăng số này để xóa ngôi cũ khi deploy */
-const THRONE_EPOCH = 2;
+const THRONE_EPOCH = 3;
 const SAVE_INTERVAL_MS = 30000;
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const POSITION_MIN_MS = 100;
