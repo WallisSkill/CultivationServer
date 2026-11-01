@@ -6,6 +6,8 @@ const { WebSocketServer } = require('ws');
 const DATA_FILE = path.join(process.env.DATA_DIR || __dirname, 'tianjiao.json');
 const LADDER_FILE = path.join(process.env.DATA_DIR || __dirname, 'ladder.json');
 const BOSS_FILE = path.join(process.env.DATA_DIR || __dirname, 'worldboss.json');
+const THRONE_FILE = path.join(process.env.DATA_DIR || __dirname, 'huvo.json');
+const THRONE_MIN_REALM = 32;
 const SAVE_INTERVAL_MS = 30000;
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const POSITION_MIN_MS = 100;
@@ -73,6 +75,14 @@ function newBoss() {
     return { hp: BOSS_BAR_UNITS * BOSS_BARS, respawnAt: 0, hits: {} };
 }
 
+function loadThrone() {
+    try {
+        return JSON.parse(fs.readFileSync(THRONE_FILE, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
 function loadBoss() {
     let saved = {};
     try {
@@ -105,6 +115,7 @@ function createWebSocketServer({ server } = {}) {
     const records = loadRecords();
     const ladder = loadLadder();
     const boss = loadBoss();
+    let throne = loadThrone();
     const bossHitAt = new Map();        // profileId -> lúc báo sát thương gần nhất
     const matches = new Map();          // matchId -> { a, b, at }
     let matchSeq = 0;
@@ -269,6 +280,25 @@ function createWebSocketServer({ server } = {}) {
         record.scores[loc] = { score: next, at: now };
         updateBoard(loc, info.id, record.name, next);
         recordsDirty = true;
+    }
+
+    /* Hư Vô Chi Chủ: người đầu tiên lên cảnh giới cuối, ai thắng người đó sẽ thế chỗ */
+    function claimThrone(info, msg) {
+        const name = String(msg.name || '').slice(0, NAME_MAX_LENGTH);
+        const stats = [msg.atk, msg.def, msg.hp].map(Number);
+        if (!info.id || !name || !msg.token || !stats.every(n => Number.isFinite(n) && n > 0)) return;
+        if (!(Number(info.profile?.realmIndex) >= THRONE_MIN_REALM)) return;
+        throne = {
+            id: info.id, name, atk: stats[0], def: stats[1], hp: stats[2],
+            look: msg.look && typeof msg.look === 'object' ? msg.look : null,
+            elements: Array.isArray(msg.elements) ? msg.elements.slice(0, 5).map(String) : [],
+            path: msg.path ? String(msg.path).slice(0, 16) : null,
+            reign: (throne?.reign || 0) + 1, at: Date.now()
+        };
+        fs.writeFile(THRONE_FILE, JSON.stringify(throne), err => {
+            if (err) console.error('Error saving throne:', err);
+        });
+        sendEach(clients.keys(), { type: 'huvo_throne', throne, news: true });
     }
 
     function ladderSorted() {
@@ -514,6 +544,7 @@ function createWebSocketServer({ server } = {}) {
                 ids.set(id, socket);
                 if (!changed) return;
                 if (isNew) socket.send(JSON.stringify({ type: 'info', message: 'Đã đăng ký hồ sơ.' }));
+                if (isNew) sendTo(socket, { type: 'huvo_throne', throne });
 
                 // 🆕 Người mới nhận danh sách đang online một lần, những người khác chỉ nghe khi có đổi
                 clients.forEach((clientInfo, clientSocket) => {
@@ -570,6 +601,12 @@ function createWebSocketServer({ server } = {}) {
             if (msg.type === 'tianjiao_report') {
                 const info = clients.get(socket);
                 if (info) reportScore(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_win') {
+                const info = clients.get(socket);
+                if (info) claimThrone(info, msg);
                 return;
             }
 
