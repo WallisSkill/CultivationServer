@@ -8,6 +8,14 @@ const LADDER_FILE = path.join(process.env.DATA_DIR || __dirname, 'ladder.json');
 const BOSS_FILE = path.join(process.env.DATA_DIR || __dirname, 'worldboss.json');
 const THRONE_FILE = path.join(process.env.DATA_DIR || __dirname, 'huvo.json');
 const THRONE_MIN_REALM = 32;
+const DUEL_MIN_REALM = 31;
+const DUEL_MAX_LOSSES = 5;
+const DUEL_STALE_MS = 15 * 60 * 1000;
+const ORDER_PER_DISCIPLE = 3;
+const ORDER_MAX_HUNT = 50;
+const SEED_CAP = 30;
+const ORDER_TITLE_MAX = 40;
+const ORDER_TEXT_MAX = 200;
 /* Tăng số này để xóa ngôi cũ khi deploy */
 const THRONE_EPOCH = 3;
 const SAVE_INTERVAL_MS = 30000;
@@ -119,6 +127,9 @@ function createWebSocketServer({ server } = {}) {
     const ladder = loadLadder();
     const boss = loadBoss();
     let throne = loadThrone();
+    let duel = null;                    // { challenger, holder, at }
+    let duelWinner = null;
+    let orderSeq = 0;
     const bossHitAt = new Map();        // profileId -> lúc báo sát thương gần nhất
     const matches = new Map();          // matchId -> { a, b, at }
     let matchSeq = 0;
@@ -291,17 +302,115 @@ function createWebSocketServer({ server } = {}) {
         const stats = [msg.atk, msg.def, msg.hp].map(Number);
         if (!info.id || !name || !msg.token || !stats.every(n => Number.isFinite(n) && n > 0)) return;
         if (!(Number(info.profile?.realmIndex) >= THRONE_MIN_REALM)) return;
+        if (throne && throne.id !== info.id && duelWinner !== info.id) return;
+        duelWinner = null;
+        const { [info.id]: promoted, ...disciples } = throne?.disciples || {};
         throne = {
             epoch: THRONE_EPOCH, id: info.id, name, atk: stats[0], def: stats[1], hp: stats[2],
             look: msg.look && typeof msg.look === 'object' ? msg.look : null,
             elements: Array.isArray(msg.elements) ? msg.elements.slice(0, 5).map(String) : [],
             path: msg.path ? String(msg.path).slice(0, 16) : null,
-            reign: (throne?.reign || 0) + 1, at: Date.now()
+            reign: (throne?.reign || 0) + 1, at: Date.now(),
+            disciples, orders: throne?.orders || [], seeds: throne?.seeds || [], losses: {}
         };
+        saveThrone();
+        sendEach(clients.keys(), { type: 'huvo_throne', throne: publicThrone(), news: true });
+        sendOrders(throne.id);
+    }
+
+    function saveThrone() {
         fs.writeFile(THRONE_FILE, JSON.stringify(throne), err => {
             if (err) console.error('Error saving throne:', err);
         });
-        sendEach(clients.keys(), { type: 'huvo_throne', throne, news: true });
+    }
+
+    function publicThrone() {
+        if (!throne) return null;
+        const { orders, losses, ...shown } = throne;
+        return shown;
+    }
+
+    function sendThrone() {
+        sendEach(clients.keys(), { type: 'huvo_throne', throne: publicThrone() });
+    }
+
+    function sendOrders(id) {
+        const socket = ids.get(id);
+        if (!socket || !throne) return;
+        const orders = (throne.orders || []).filter(o => o.to === id || throne.id === id);
+        sendTo(socket, { type: 'huvo_orders', orders });
+    }
+
+    function joinThrone(info, msg) {
+        const name = String(msg.name || '').slice(0, NAME_MAX_LENGTH);
+        if (!throne || !info.id || info.id === throne.id || !name || !msg.token) return;
+        if (!(Number(info.profile?.realmIndex) >= THRONE_MIN_REALM)) return;
+        (throne.disciples ||= {})[info.id] = { name };
+        saveThrone();
+        sendThrone();
+        sendOrders(info.id);
+    }
+
+    function addOrder(info, msg) {
+        if (!throne || info.id !== throne.id || !throne.disciples?.[msg.to]) return;
+        if (msg.kind !== 'hunt' && msg.kind !== 'seed') return;
+        const title = String(msg.title || '').slice(0, ORDER_TITLE_MAX);
+        const text = String(msg.text || '').slice(0, ORDER_TEXT_MAX);
+        const orders = (throne.orders ||= []);
+        if (!title || !text || orders.filter(o => o.to === msg.to).length >= ORDER_PER_DISCIPLE) return;
+        orders.push({
+            id: `${Date.now().toString(36)}${(orderSeq++).toString(36)}`, to: String(msg.to), kind: msg.kind,
+            loc: String(msg.loc || '').slice(0, 32), monster: String(msg.monster || '').slice(0, 40),
+            n: Math.min(ORDER_MAX_HUNT, Math.max(1, Math.floor(Number(msg.n)) || 1)), title, text, from: throne.name
+        });
+        saveThrone();
+        sendOrders(msg.to);
+        sendOrders(throne.id);
+    }
+
+    /* Việc xong thì báo Chủ; lệnh gieo cơ duyên thành nhiệm vụ ẩn cho mọi người */
+    function finishOrder(info, msg) {
+        const order = throne?.orders?.find(o => o.id === msg.id && o.to === info.id);
+        if (!order) return;
+        throne.orders = throne.orders.filter(o => o !== order);
+        if (order.kind === 'seed') throne.seeds = [...(throne.seeds || []), { ...order, kind: 'seed_quest' }].slice(-SEED_CAP);
+        saveThrone();
+        if (order.kind === 'seed') sendThrone();
+        sendOrders(info.id);
+        sendOrders(throne.id);
+        const holder = ids.get(throne.id);
+        if (holder) sendTo(holder, { type: 'huvo_report', name: throne.disciples?.[info.id]?.name || '', title: order.title });
+    }
+
+    /* Khiêu chiến là PvP thật: Chủ phải online và không được từ chối */
+    function startDuel(socket, info, msg) {
+        const fail = reason => sendTo(socket, { type: 'huvo_duel_fail', reason });
+        if (!throne || !info.id || info.id === throne.id || !msg.token || !msg.profile) return;
+        if (!(Number(info.profile?.realmIndex) >= DUEL_MIN_REALM)) return;
+        if ((throne.losses?.[info.id] || 0) >= DUEL_MAX_LOSSES) return fail('tries');
+        const holder = ids.get(throne.id);
+        const holderInfo = holder && clients.get(holder);
+        if (!holderInfo?.profile || holder.readyState !== 1) return fail('offline');
+        if (duel && Date.now() - duel.at < DUEL_STALE_MS) return fail('busy');
+        duel = { challenger: info.id, holder: throne.id, at: Date.now() };
+        sendTo(socket, { type: 'huvo_duel', role: 'challenger', opponent: holderInfo.profile });
+        sendTo(holder, { type: 'huvo_duel', role: 'holder', opponent: msg.profile });
+    }
+
+    function endDuel(winner) {
+        if (!duel) return;
+        const { challenger, holder } = duel;
+        duel = null;
+        if (winner === challenger) duelWinner = challenger;
+        else if (throne) {
+            (throne.losses ||= {})[challenger] = (throne.losses[challenger] || 0) + 1;
+            saveThrone();
+        }
+        const tries = throne?.losses?.[challenger] || 0;
+        [challenger, holder].forEach(id => {
+            const socket = ids.get(id);
+            if (socket) sendTo(socket, { type: 'huvo_duel_end', winner, tries });
+        });
     }
 
     function ladderSorted() {
@@ -489,6 +598,7 @@ function createWebSocketServer({ server } = {}) {
         const leaving = info.id && (!ids.get(info.id) || ids.get(info.id) === socket);
         if (info.id && ids.get(info.id) === socket) ids.delete(info.id);
         if (leaving) settleAfterGrace(info.id);
+        if (leaving && duel && (info.id === duel.challenger || info.id === duel.holder)) endDuel(info.id === duel.holder ? duel.challenger : duel.holder);
         const idx = waiting.findIndex((w) => w.socket === socket);
         if (idx >= 0) waiting.splice(idx, 1);
     }
@@ -547,7 +657,8 @@ function createWebSocketServer({ server } = {}) {
                 ids.set(id, socket);
                 if (!changed) return;
                 if (isNew) socket.send(JSON.stringify({ type: 'info', message: 'Đã đăng ký hồ sơ.' }));
-                if (isNew) sendTo(socket, { type: 'huvo_throne', throne });
+                if (isNew) sendTo(socket, { type: 'huvo_throne', throne: publicThrone() });
+                if (isNew) sendOrders(id);
 
                 // 🆕 Người mới nhận danh sách đang online một lần, những người khác chỉ nghe khi có đổi
                 clients.forEach((clientInfo, clientSocket) => {
@@ -610,6 +721,45 @@ function createWebSocketServer({ server } = {}) {
             if (msg.type === 'huvo_win') {
                 const info = clients.get(socket);
                 if (info) claimThrone(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_join') {
+                const info = clients.get(socket);
+                if (info) joinThrone(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_order') {
+                const info = clients.get(socket);
+                if (info) addOrder(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_order_done') {
+                const info = clients.get(socket);
+                if (info) finishOrder(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_challenge') {
+                const info = clients.get(socket);
+                if (info) startDuel(socket, info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_duel_win') {
+                const id = clients.get(socket)?.id;
+                if (duel && (id === duel.challenger || id === duel.holder)) endDuel(id);
+                return;
+            }
+
+            if (msg.type === 'huvo_duel_busy') {
+                const id = clients.get(socket)?.id;
+                if (!duel || id !== duel.holder) return;
+                const challenger = ids.get(duel.challenger);
+                duel = null;
+                if (challenger) sendTo(challenger, { type: 'huvo_duel_fail', reason: 'busy' });
                 return;
             }
 
