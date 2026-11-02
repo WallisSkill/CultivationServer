@@ -13,6 +13,7 @@ const DUEL_MAX_LOSSES = 5;
 const DUEL_STALE_MS = 15 * 60 * 1000;
 const ORDER_PER_DISCIPLE = 3;
 const ORDER_MAX_HUNT = 50;
+const DISCIPLE_SEATS = 12;
 const ORDER_WORKS = ['word', 'hunt', 'gather', 'boss'];
 const ORDER_REWARD_MAX = 2;
 const SEED_CAP = 30;
@@ -343,19 +344,37 @@ function createWebSocketServer({ server } = {}) {
         sendTo(socket, { type: 'huvo_orders', orders });
     }
 
+    /* Hết ghế thì người mới chỉ vào được chỗ của đệ tử mình đã thắng; người bị đẩy xuống phải thách đấu lại */
     function joinThrone(info, msg) {
         const name = String(msg.name || '').slice(0, NAME_MAX_LENGTH);
         if (!throne || !info.id || info.id === throne.id || !name || !msg.token) return;
         if (!(Number(info.profile?.realmIndex) >= THRONE_MIN_REALM)) return;
         const stats = [msg.atk, msg.def, msg.hp].map(Number);
         if (!stats.every(n => Number.isFinite(n) && n > 0)) return;
-        (throne.disciples ||= {})[info.id] = {
+        const disciples = (throne.disciples ||= {});
+        const seated = !!disciples[info.id];
+        const replaced = !seated && Object.keys(disciples).length >= DISCIPLE_SEATS ? String(msg.replace || '') : null;
+        if (replaced !== null && (!disciples[replaced] || replaced === info.id)) {
+            const socket = ids.get(info.id);
+            if (socket) sendTo(socket, { type: 'huvo_full' });
+            return;
+        }
+        const seat = {
             name, stage: Math.max(0, Math.floor(Number(info.profile.realmStage)) || 0),
             atk: stats[0], def: stats[1], hp: stats[2],
             look: msg.look && typeof msg.look === 'object' ? msg.look : null,
             elements: Array.isArray(msg.elements) ? msg.elements.slice(0, 5).map(String) : [],
             path: msg.path ? String(msg.path).slice(0, 16) : null
         };
+        if (replaced !== null) {
+            throne.disciples = Object.fromEntries(Object.entries(disciples).map(([id, d]) => (id === replaced ? [info.id, seat] : [id, d])));
+            throne.orders = (throne.orders || []).filter(o => o.to !== replaced);
+            (throne.exiled ||= {})[replaced] = true;
+            delete throne.losses?.[replaced];
+            sendOrders(replaced);
+            sendOrders(throne.id);
+        } else disciples[info.id] = seat;
+        if (throne.exiled) delete throne.exiled[info.id];
         saveThrone();
         sendThrone();
         sendOrders(info.id);
