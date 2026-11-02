@@ -337,7 +337,7 @@ function createWebSocketServer({ server } = {}) {
     function sendOrders(id) {
         const socket = ids.get(id);
         if (!socket || !throne) return;
-        const orders = (throne.orders || []).filter(o => o.to === id || throne.id === id);
+        const orders = (throne.orders || []).filter(o => o.to === id || (o.by || throne.id) === id);
         sendTo(socket, { type: 'huvo_orders', orders });
     }
 
@@ -345,14 +345,28 @@ function createWebSocketServer({ server } = {}) {
         const name = String(msg.name || '').slice(0, NAME_MAX_LENGTH);
         if (!throne || !info.id || info.id === throne.id || !name || !msg.token) return;
         if (!(Number(info.profile?.realmIndex) >= THRONE_MIN_REALM)) return;
-        (throne.disciples ||= {})[info.id] = { name };
+        const stats = [msg.atk, msg.def, msg.hp].map(Number);
+        if (!stats.every(n => Number.isFinite(n) && n > 0)) return;
+        (throne.disciples ||= {})[info.id] = {
+            name, stage: Math.max(0, Math.floor(Number(info.profile.realmStage)) || 0),
+            atk: stats[0], def: stats[1], hp: stats[2],
+            look: msg.look && typeof msg.look === 'object' ? msg.look : null,
+            elements: Array.isArray(msg.elements) ? msg.elements.slice(0, 5).map(String) : [],
+            path: msg.path ? String(msg.path).slice(0, 16) : null
+        };
         saveThrone();
         sendThrone();
         sendOrders(info.id);
     }
 
+    /* Chủ sai được mọi đệ tử, đệ tử chỉ sai được người ở tiểu cảnh giới thấp hơn */
+    function throneRank(id) {
+        if (id === throne.id) return Infinity;
+        return throne.disciples?.[id]?.stage ?? -1;
+    }
+
     function addOrder(info, msg) {
-        if (!throne || info.id !== throne.id || !throne.disciples?.[msg.to]) return;
+        if (!throne || !throne.disciples?.[msg.to] || throneRank(info.id) <= throneRank(msg.to)) return;
         if (msg.kind !== 'hunt' && msg.kind !== 'seed') return;
         const title = String(msg.title || '').slice(0, ORDER_TITLE_MAX);
         const text = String(msg.text || '').slice(0, ORDER_TEXT_MAX);
@@ -361,11 +375,12 @@ function createWebSocketServer({ server } = {}) {
         orders.push({
             id: `${Date.now().toString(36)}${(orderSeq++).toString(36)}`, to: String(msg.to), kind: msg.kind,
             loc: String(msg.loc || '').slice(0, 32), monster: String(msg.monster || '').slice(0, 40),
-            n: Math.min(ORDER_MAX_HUNT, Math.max(1, Math.floor(Number(msg.n)) || 1)), title, text, from: throne.name
+            n: Math.min(ORDER_MAX_HUNT, Math.max(1, Math.floor(Number(msg.n)) || 1)), title, text, by: info.id,
+            from: info.id === throne.id ? throne.name : throne.disciples[info.id].name
         });
         saveThrone();
         sendOrders(msg.to);
-        sendOrders(throne.id);
+        sendOrders(info.id);
     }
 
     /* Việc xong thì báo Chủ; lệnh gieo cơ duyên thành nhiệm vụ ẩn cho mọi người */
@@ -377,8 +392,8 @@ function createWebSocketServer({ server } = {}) {
         saveThrone();
         if (order.kind === 'seed') sendThrone();
         sendOrders(info.id);
-        sendOrders(throne.id);
-        const holder = ids.get(throne.id);
+        sendOrders(order.by || throne.id);
+        const holder = ids.get(order.by || throne.id);
         if (holder) sendTo(holder, { type: 'huvo_report', name: throne.disciples?.[info.id]?.name || '', title: order.title });
     }
 
