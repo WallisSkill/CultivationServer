@@ -13,6 +13,8 @@ const DUEL_MAX_LOSSES = 5;
 const DUEL_STALE_MS = 15 * 60 * 1000;
 const ORDER_PER_DISCIPLE = 3;
 const ORDER_MAX_HUNT = 50;
+const ORDER_WORKS = ['word', 'hunt', 'gather', 'boss'];
+const ORDER_REWARD_MAX = 2;
 const SEED_CAP = 30;
 const ORDER_TITLE_MAX = 40;
 const ORDER_TEXT_MAX = 200;
@@ -337,7 +339,7 @@ function createWebSocketServer({ server } = {}) {
     function sendOrders(id) {
         const socket = ids.get(id);
         if (!socket || !throne) return;
-        const orders = (throne.orders || []).filter(o => o.to === id || (o.by || throne.id) === id);
+        const orders = (throne.orders || []).filter(o => id === throne.id || o.to === id || (o.by || throne.id) === id);
         sendTo(socket, { type: 'huvo_orders', orders });
     }
 
@@ -367,13 +369,15 @@ function createWebSocketServer({ server } = {}) {
 
     function addOrder(info, msg) {
         if (!throne || !throne.disciples?.[msg.to] || throneRank(info.id) <= throneRank(msg.to)) return;
-        if (msg.kind !== 'hunt' && msg.kind !== 'seed') return;
+        if (!ORDER_WORKS.includes(msg.work)) return;
         const title = String(msg.title || '').slice(0, ORDER_TITLE_MAX);
         const text = String(msg.text || '').slice(0, ORDER_TEXT_MAX);
         const orders = (throne.orders ||= []);
         if (!title || !text || orders.filter(o => o.to === msg.to).length >= ORDER_PER_DISCIPLE) return;
         orders.push({
-            id: `${Date.now().toString(36)}${(orderSeq++).toString(36)}`, to: String(msg.to), kind: msg.kind,
+            id: `${Date.now().toString(36)}${(orderSeq++).toString(36)}`, to: String(msg.to), kind: 'seed', work: msg.work,
+            target: msg.work === 'word' && msg.target === 'all' ? 'first' : String(msg.target || 'first').slice(0, 64),
+            reward: Math.min(ORDER_REWARD_MAX, Math.max(0, Math.floor(Number(msg.reward)) || 0)),
             loc: String(msg.loc || '').slice(0, 32), monster: String(msg.monster || '').slice(0, 40),
             n: Math.min(ORDER_MAX_HUNT, Math.max(1, Math.floor(Number(msg.n)) || 1)), title, text, by: info.id,
             from: info.id === throne.id ? throne.name : throne.disciples[info.id].name
@@ -383,7 +387,7 @@ function createWebSocketServer({ server } = {}) {
         sendOrders(info.id);
     }
 
-    /* Việc xong thì báo Chủ; lệnh gieo cơ duyên thành nhiệm vụ ẩn cho mọi người */
+    /* Đệ tử xuống xong thì việc hiện ở Giới dưới: cho mọi người, người nhận đầu tiên hoặc người được chỉ định */
     function finishOrder(info, msg) {
         const order = throne?.orders?.find(o => o.id === msg.id && o.to === info.id);
         if (!order) return;
@@ -395,6 +399,41 @@ function createWebSocketServer({ server } = {}) {
         sendOrders(order.by || throne.id);
         const holder = ids.get(order.by || throne.id);
         if (holder) sendTo(holder, { type: 'huvo_report', name: throne.disciples?.[info.id]?.name || '', title: order.title });
+    }
+
+    function claimSeed(socket, info, msg) {
+        const seed = throne?.seeds?.find(o => o.id === msg.id);
+        const ok = !!seed && seed.target === 'first' && (!seed.claimedBy || seed.claimedBy === info.id);
+        if (ok && !seed.claimedBy) {
+            seed.claimedBy = info.id;
+            saveThrone();
+            sendThrone();
+        }
+        sendTo(socket, { type: 'huvo_claim', id: String(msg.id || ''), ok });
+    }
+
+    function finishSeed(info, msg) {
+        const seed = throne?.seeds?.find(o => o.id === msg.id && (o.claimedBy === info.id || o.target === info.id));
+        if (!seed) return;
+        throne.seeds = throne.seeds.filter(o => o !== seed);
+        saveThrone();
+        sendThrone();
+        [...new Set([seed.by || throne.id, throne.id])].forEach(id => {
+            const socket = ids.get(id);
+            if (socket) sendTo(socket, { type: 'huvo_report', name: info.profile?.name || '', title: seed.title });
+        });
+    }
+
+    /* Chỉ Chủ được xóa việc đã giao, dù đệ tử chưa xuống hay việc đã hiện ở Giới dưới */
+    function deleteOrder(info, msg) {
+        if (!throne || info.id !== throne.id) return;
+        const order = throne.orders?.find(o => o.id === msg.id);
+        throne.orders = (throne.orders || []).filter(o => o !== order);
+        throne.seeds = (throne.seeds || []).filter(o => o.id !== msg.id);
+        saveThrone();
+        sendThrone();
+        sendOrders(throne.id);
+        if (order) sendOrders(order.to);
     }
 
     /* Khiêu chiến là PvP thật: Chủ phải online và không được từ chối */
@@ -754,6 +793,24 @@ function createWebSocketServer({ server } = {}) {
             if (msg.type === 'huvo_order_done') {
                 const info = clients.get(socket);
                 if (info) finishOrder(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_claim') {
+                const info = clients.get(socket);
+                if (info) claimSeed(socket, info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_seed_done') {
+                const info = clients.get(socket);
+                if (info) finishSeed(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_order_delete') {
+                const info = clients.get(socket);
+                if (info) deleteOrder(info, msg);
                 return;
             }
 
