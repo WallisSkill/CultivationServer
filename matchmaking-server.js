@@ -380,6 +380,29 @@ function createWebSocketServer({ server } = {}) {
         sendOrders(info.id);
     }
 
+    /* Chỉ Chủ được đuổi đệ tử: mất ghế và việc đang giữ, phải thách đấu lại như người bị đẩy xuống */
+    function expelDisciple(info, msg) {
+        const id = String(msg.id || '');
+        if (!throne || info.id !== throne.id || !throne.disciples?.[id]) return;
+        delete throne.disciples[id];
+        throne.orders = (throne.orders || []).filter(o => o.to !== id);
+        (throne.exiled ||= {})[id] = true;
+        delete throne.losses?.[id];
+        saveThrone();
+        sendThrone();
+        sendOrders(id);
+        sendOrders(throne.id);
+    }
+
+    /* Đổi trang phục thì ghế đổi theo; chỉ số trên ghế vẫn giữ như lúc nhập môn */
+    function updateThroneLook(info, msg) {
+        const seat = info.id === throne?.id ? throne : throne?.disciples?.[info.id];
+        if (!seat || !msg.look || typeof msg.look !== 'object') return;
+        seat.look = msg.look;
+        saveThrone();
+        sendThrone();
+    }
+
     /* Chủ sai được mọi đệ tử, đệ tử chỉ sai được người ở tiểu cảnh giới thấp hơn */
     function throneRank(id) {
         if (id === throne.id) return Infinity;
@@ -812,6 +835,18 @@ function createWebSocketServer({ server } = {}) {
             if (msg.type === 'huvo_order_done') {
                 const info = clients.get(socket);
                 if (info) finishOrder(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_expel') {
+                const info = clients.get(socket);
+                if (info) expelDisciple(info, msg);
+                return;
+            }
+
+            if (msg.type === 'huvo_look') {
+                const info = clients.get(socket);
+                if (info) updateThroneLook(info, msg);
                 return;
             }
 
